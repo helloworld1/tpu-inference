@@ -28,7 +28,7 @@ steps:
        - bash .buildkite/scripts/generate_support_matrices.sh
 
    - label: "Commit support matrices if is nightly build or release tag specified"
-     <<: *run-on-nightly-or-tag
+     if: build.env("BUILDKITE_BRANCH") == "main" && (build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/)
      key: commit_support_matrices
      depends_on: generate_support_matrices
      agents:
