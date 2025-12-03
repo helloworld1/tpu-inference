@@ -60,7 +60,7 @@ setup_environment() {
   echo "Python dependencies installed"
 
 #  VLLM_COMMIT_HASH=$(buildkite-agent meta-data get "VLLM_COMMIT_HASH" --default "")
-  VLLM_COMMIT_HASH="v0.12.0"
+  VLLM_COMMIT_HASH="releases/v0.12.0"
 
   docker build \
       --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
