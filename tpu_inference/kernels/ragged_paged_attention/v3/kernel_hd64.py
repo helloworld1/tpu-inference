@@ -1352,6 +1352,98 @@ def ragged_paged_attention_hd64(
     # Debug params.
     debug_mode: bool = False,
 ):
+    is_decode_only = distribution[0] == distribution[2]
+    is_prefill_only = distribution[1] == distribution[2]
+
+    orig_func = functools.partial(ragged_paged_attention_hd64_orig,
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sink,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        strict_sliding_window=strict_sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        # Kernel tuning params.
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
+    )
+
+    return lax.cond(
+        is_decode_only,
+        lambda: orig_func(mode="decode"),
+        lambda: lax.cond(
+            is_prefill_only,
+            lambda: orig_func(mode="prefill"),
+            lambda: orig_func(mode="mixed"),
+        )
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "sliding_window",
+        "strict_sliding_window",
+        "soft_cap",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "debug_mode",
+        "mode",
+    ),
+    donate_argnames=("kv_cache", ),
+)
+def ragged_paged_attention_hd64_orig(
+    queries: jax.
+    Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    values: jax.
+    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    kv_cache: jax.
+    Array,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    attention_sink: jax.Array | None = None,  # f32[actual_num_q_heads]
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    strict_sliding_window: bool = True,
+    soft_cap: float | None = None,
+    mask_value: float | None = DEFAULT_MASK_VALUE,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    # Kernel optimization params.
+    chunk_prefill_size: int | None = None,
+    # Kernel tuning params.
+    num_kv_pages_per_block: int | None = None,
+    num_queries_per_block: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    # Debug params.
+    debug_mode: bool = False,
+    mode: str = "prefill"
+):
     """A variant of ragged paged attention for head_dim=64.
 
   Args:
@@ -1445,10 +1537,18 @@ def ragged_paged_attention_hd64(
             pages_per_seq,
         )
 
-    bq_sz = 8
-    bkv_p = 16
+    if mode == "decode":
+        bq_sz = 16
+        bkv_p = 24
+    elif mode == "prefill":
+        bq_sz = 128
+        bkv_p = 24
+    else:
+        bq_sz = 16
+        bkv_p = 24
+
     if sliding_window is not None:
-        bkv_p = 4
+        bkv_p = 4 
 
     bkv_sz = bkv_p * page_size
     if vmem_limit_bytes is None:
