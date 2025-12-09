@@ -357,6 +357,7 @@ def _ragged_paged_attention_kernel(
     debug_print("[RPA debug] bq_sz_decode={}", bq_sz_decode)
     debug_print("[RPA debug] bq_sz_prefill={}", bq_sz_prefill)
     debug_print("[RPA debug] bq_sz_mixed={}", bq_sz_mixed)
+    debug_print("[RPA debug] max_bq_sz={}", max_bq_sz)
     debug_print("[RPA debug] q_start={}", q_start)
     debug_print("[RPA debug] q_end={}", q_end)
     debug_print("[RPA debug] q_len={}", q_len)
@@ -942,9 +943,10 @@ def _ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
+            # Use bo_x2_ref.shape[2] as the source of truth for max_bq_sz.
             bo_ref = bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 actual_num_kv_heads,
-                max_bq_sz * num_q_heads_per_kv_head_per_packing,
+                bo_x2_ref.shape[2] * num_q_heads_per_kv_head_per_packing,
                 actual_head_dim_x2,
             )
             store_len = actual_bq_sz * num_q_heads_per_kv_head_per_packing
