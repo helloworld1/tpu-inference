@@ -28,6 +28,9 @@ class RaggedPagedAttentionHeadDim64KernelTest(jtu.JaxTestCase):
         *,
         num_kv_pages_per_block=8,
         num_queries_per_block=64,
+        num_queries_per_block_decode=None,
+        num_queries_per_block_prefill=None,
+        num_queries_per_block_mixed=None,
         vmem_limit_bytes=100 * 1024 * 1024,
         max_num_batched_tokens=512,
         max_num_seq=8,
@@ -172,6 +175,9 @@ class RaggedPagedAttentionHeadDim64KernelTest(jtu.JaxTestCase):
             **kwargs,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
+            num_queries_per_block_decode=num_queries_per_block_decode,
+            num_queries_per_block_prefill=num_queries_per_block_prefill,
+            num_queries_per_block_mixed=num_queries_per_block_mixed,
             vmem_limit_bytes=vmem_limit_bytes,
         )
         output = output[:cu_q_lens[distribution[-1]]]

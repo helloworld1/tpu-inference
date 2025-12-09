@@ -275,7 +275,9 @@ def _ragged_paged_attention_kernel(
     v_scale: float | None = None,
     chunk_prefill_size: int | None = None,
     bkv_p,
-    bq_sz,
+    bq_sz_decode: int,
+    bq_sz_prefill: int,
+    bq_sz_mixed: int,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -944,25 +946,30 @@ def _ragged_paged_attention_kernel(
     @pl.when(seq_idx == 0)
     def prologue():
         bkv_x2_ref[...] = jnp.zeros(bkv_x2_ref.shape, bkv_x2_ref.dtype)
-        start_fetch_bq(0, 0, 0)
+        start_fetch_bq(0, 0, 0, bq_sz_decode)
         start_fetch_bkv(0, bkv_idx_start, 0)
 
     @pl.when(seq_idx < decode_end)
     def process_decode():
-        process(static_q_len=1)
+        process(static_q_len=1, bq_sz=bq_sz_decode)
 
     @pl.when(jnp.logical_and(decode_end <= seq_idx, seq_idx < prefill_end))
     def process_prefill():
-        process(static_q_len=chunk_prefill_size)
+        process(static_q_len=chunk_prefill_size, bq_sz=bq_sz_prefill)
 
     @pl.when(jnp.logical_and(prefill_end <= seq_idx, seq_idx < mixed_end))
     def process_mixed():
-        process()
+        process(bq_sz=bq_sz_mixed)
 
     @pl.when(seq_idx == num_seqs - 1)
     def epilogue():
+        bq_sz = lax.select(
+            seq_idx < decode_end,
+            bq_sz_decode,
+            lax.select(seq_idx < prefill_end, bq_sz_prefill, bq_sz_mixed),
+        )
         for i in range(2):
-            wait_send_bo(i)
+            wait_send_bo(i, bq_sz)
             wait_update_kv_cache(i)
 
     ### ------- Kernel end ------- ###
@@ -1097,6 +1104,9 @@ def dynamic_validate_inputs(
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
+    num_queries_per_block_decode: int | None = None,
+    num_queries_per_block_prefill: int | None = None,
+    num_queries_per_block_mixed: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1122,6 +1132,9 @@ def dynamic_validate_inputs(
         chunk_prefill_size=chunk_prefill_size,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
+        num_queries_per_block_decode=num_queries_per_block_decode,
+        num_queries_per_block_prefill=num_queries_per_block_prefill,
+        num_queries_per_block_mixed=num_queries_per_block_mixed,
         vmem_limit_bytes=vmem_limit_bytes,
         debug_mode=debug_mode,
     )
@@ -1189,6 +1202,9 @@ def static_validate_inputs(
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
+    num_queries_per_block_decode: int | None = None,
+    num_queries_per_block_prefill: int | None = None,
+    num_queries_per_block_mixed: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1293,8 +1309,19 @@ def static_validate_inputs(
     if num_queries_per_block is not None:
         if num_queries_per_block <= 0:
             raise ValueError(f"{num_queries_per_block=} must be positive.")
+    if num_queries_per_block_decode is not None:
+        if num_queries_per_block_decode <= 0:
+            raise ValueError(f"{num_queries_per_block_decode=} must be positive.")
+    if num_queries_per_block_prefill is not None:
+        if num_queries_per_block_prefill <= 0:
+            raise ValueError(
+                f"{num_queries_per_block_prefill=} must be positive.")
+    if num_queries_per_block_mixed is not None:
+        if num_queries_per_block_mixed <= 0:
+            raise ValueError(
+                f"{num_queries_per_block_mixed=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
-        raise ValueError(f"{vmem_limit_bytes=} must be positive.")
+        raise ValueError(f"{vmem_limit_bytes=} must be positive.}
 
     # No constraints for the following inputs.
     del sm_scale
@@ -1351,6 +1378,9 @@ def ragged_paged_attention_hd64(
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
+    num_queries_per_block_decode: int | None = None,
+    num_queries_per_block_prefill: int | None = None,
+    num_queries_per_block_mixed: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1383,6 +1413,12 @@ def ragged_paged_attention_hd64(
       attention block in the pallas kernel.
     num_queries_per_block: number of kv pages to be processed in one flash
       attention block in the pallas kernel.
+    num_queries_per_block_decode: number of queries for decode to be processed
+      in one flash attention block in the pallas kernel.
+    num_queries_per_block_prefill: number of queries for prefill to be processed
+      in one flash attention block in the pallas kernel.
+    num_queries_per_block_mixed: number of queries for mixed to be processed in
+      one flash attention block in the pallas kernel.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
     debug_mode: if true, RPA does not issue any DMAs or run flash attention but
       print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
@@ -1411,6 +1447,9 @@ def ragged_paged_attention_hd64(
         chunk_prefill_size=chunk_prefill_size,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
+        num_queries_per_block_decode=num_queries_per_block_decode,
+        num_queries_per_block_prefill=num_queries_per_block_prefill,
+        num_queries_per_block_mixed=num_queries_per_block_mixed,
         vmem_limit_bytes=vmem_limit_bytes,
     )
 
@@ -1436,8 +1475,11 @@ def ragged_paged_attention_hd64(
 
     bkv_p = num_kv_pages_per_block
     bq_sz = num_queries_per_block
+    bq_sz_decode = num_queries_per_block_decode
+    bq_sz_prefill = num_queries_per_block_prefill
+    bq_sz_mixed = num_queries_per_block_mixed
     if bq_sz is None or bkv_p is None:
-        bkv_p, bq_sz = get_tuned_block_sizes(
+        tuned_bkv_p, tuned_bq_sz = get_tuned_block_sizes(
             q.dtype,
             kv_cache.dtype,
             actual_num_q_heads,
@@ -1447,11 +1489,22 @@ def ragged_paged_attention_hd64(
             max_num_tokens,
             pages_per_seq,
         )
+        if bkv_p is None:
+            bkv_p = tuned_bkv_p
+        if bq_sz is None:
+            bq_sz = tuned_bq_sz
 
-    bq_sz = 16
-    bkv_p = 24
+    if bq_sz_decode is None:
+        bq_sz_decode = bq_sz
+    if bq_sz_prefill is None:
+        bq_sz_prefill = bq_sz
+    if bq_sz_mixed is None:
+        bq_sz_mixed = bq_sz
+
     if sliding_window is not None:
         bkv_p = 4
+
+    max_bq_sz = max(bq_sz_decode, bq_sz_prefill, bq_sz_mixed)
 
     bkv_sz = bkv_p * page_size
     if vmem_limit_bytes is None:
@@ -1479,20 +1532,20 @@ def ragged_paged_attention_hd64(
     )
 
     bq_double_buf = pltpu.VMEM(
-        (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+        (2, actual_num_kv_heads, max_bq_sz, *q.shape[2:]),
         q.dtype,
     )
 
     bo_double_buf = bq_double_buf
 
     l_scratch = pltpu.VMEM(
-        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+        (actual_num_kv_heads, max_bq_sz * num_q_heads_per_kv_head, 128),
         jnp.float32,
     )
     m_scratch = l_scratch
 
     acc_scratch = pltpu.VMEM(
-        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+        (actual_num_kv_heads, max_bq_sz * num_q_heads_per_kv_head, head_dim),
         jnp.float32,
     )
 
@@ -1536,7 +1589,9 @@ def ragged_paged_attention_hd64(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 chunk_prefill_size=chunk_prefill_size,
-                bq_sz=bq_sz,
+                bq_sz_decode=bq_sz_decode,
+                bq_sz_prefill=bq_sz_prefill,
+                bq_sz_mixed=bq_sz_mixed,
                 bkv_p=bkv_p,
                 debug_mode=debug_mode,
             ),
