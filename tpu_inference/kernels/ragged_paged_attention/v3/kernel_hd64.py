@@ -275,7 +275,8 @@ def _ragged_paged_attention_kernel(
     v_scale: float | None = None,
     chunk_prefill_size: int | None = None,
     bkv_p,
-    bq_sz,
+    decode_bq_sz: int,
+    prefill_bq_sz: int,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -346,7 +347,8 @@ def _ragged_paged_attention_kernel(
     debug_print("[RPA debug] page_size={}", page_size)
     debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
     debug_print("[RPA debug] bkv_sz={}", bkv_sz)
-    debug_print("[RPA debug] bq_sz={}", bq_sz)
+    debug_print("[RPA debug] decode_bq_sz={}", decode_bq_sz)
+    debug_print("[RPA debug] prefill_bq_sz={}", prefill_bq_sz)
     debug_print("[RPA debug] q_start={}", q_start)
     debug_print("[RPA debug] q_end={}", q_end)
     debug_print("[RPA debug] q_len={}", q_len)
@@ -359,6 +361,7 @@ def _ragged_paged_attention_kernel(
         bq_idx,
         bkv_idx,
         kv_head_idx,
+        bq_sz,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -616,7 +619,7 @@ def _ragged_paged_attention_kernel(
                 wait=True,
             )
 
-    def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
+    def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
         vmem_ref = bq_x2_ref.at[bq_sem_idx]
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
@@ -640,7 +643,7 @@ def _ragged_paged_attention_kernel(
             wait,
         )
 
-    def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
+    def _send_bo(seq_idx, bo_idx, bo_sem_idx, bq_sz, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx]
         q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
@@ -670,16 +673,16 @@ def _ragged_paged_attention_kernel(
     def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
 
-    def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+    def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz):
+        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz)
 
-    def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
+    def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz):
+        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz, wait=True)
 
-    def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
+    def start_send_bo(seq_idx, bo_idx, bo_sem_idx, bq_sz):
         bo_ids_ref[bo_sem_idx] = seq_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
-        _send_bo(seq_idx, bo_idx, bo_sem_idx)
+        _send_bo(seq_idx, bo_idx, bo_sem_idx, bq_sz)
 
     def wait_send_bo(bo_sem_idx):
         old_seq_idx = bo_ids_ref[bo_sem_idx]
@@ -687,7 +690,12 @@ def _ragged_paged_attention_kernel(
 
         @pl.when(jnp.logical_and(0 <= old_seq_idx, old_seq_idx <= seq_idx))
         def _():
-            _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
+            bq_sz = lax.cond(
+                old_seq_idx < decode_end,
+                lambda: decode_bq_sz,
+                lambda: prefill_bq_sz,
+            )
+            _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, bq_sz, wait=True)
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
@@ -709,7 +717,7 @@ def _ragged_paged_attention_kernel(
                              update_sz,
                              wait=True)
 
-    def load_bq(bq_sem_idx, kv_head_idx, *, actual_bq_sz=bq_sz):
+    def load_bq(bq_sem_idx, kv_head_idx, bq_sz, *, actual_bq_sz):
         q_ref = (bq_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
                 bq_sz * num_q_heads_per_kv_head_per_packing,
@@ -756,7 +764,7 @@ def _ragged_paged_attention_kernel(
             [src for _ in range(target_minor // src.shape[-1])],
             axis=-1)[..., :shape[-1]]
 
-    def process(static_q_len=None):
+    def process(bq_sz, static_q_len=None):
         num_bkv = cdiv(kv_len, bkv_sz)
         if static_q_len is None:
             actual_bq_sz = bq_sz
@@ -804,7 +812,13 @@ def _ragged_paged_attention_kernel(
             @pl.when(next_seq_idx < num_seqs)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
-                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+                next_bq_sz = lax.cond(
+                    next_seq_idx < decode_end,
+                    lambda: decode_bq_sz,
+                    lambda: prefill_bq_sz,
+                )
+                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx,
+                               next_bq_sz)
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
@@ -829,7 +843,7 @@ def _ragged_paged_attention_kernel(
                 # Wait for cur bq if not ready yet
                 @pl.when(bkv_idx == bkv_idx_start)
                 def wait_cur_bq():
-                    wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx, bq_sz)
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
@@ -871,6 +885,7 @@ def _ragged_paged_attention_kernel(
                             break
                         cur_kv_head_bq = load_bq(bq_sem_idx,
                                                  cur_kv_head_idx,
+                                                 bq_sz,
                                                  actual_bq_sz=actual_bq_sz)
                         cur_kv_head__bkv = bkv_lst[i]
                         # FlashAttention is divided into `flash_attention_step1_qk_softmax`
@@ -885,6 +900,7 @@ def _ragged_paged_attention_kernel(
                                 bq_idx=bq_idx,
                                 bkv_idx=bkv_idx,
                                 kv_head_idx=cur_kv_head_idx,
+                                bq_sz=bq_sz,
                             ))
                         if prev_bq_shape_0 is not None:
                             flash_attention_step2_pv(
@@ -937,7 +953,7 @@ def _ragged_paged_attention_kernel(
             )[...] = pltpu.bitcast(out, jnp.int32)
 
             # Send cur bo
-            start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+            start_send_bo(seq_idx, bq_idx, bo_sem_idx, bq_sz)
 
         lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
 
@@ -945,20 +961,20 @@ def _ragged_paged_attention_kernel(
 
     @pl.when(seq_idx == 0)
     def prologue():
-        start_fetch_bq(0, 0, 0)
+        start_fetch_bq(0, 0, 0, decode_bq_sz)
         start_fetch_bkv(0, bkv_idx_start, 0)
 
     @pl.when(seq_idx < decode_end)
     def process_decode():
-        process(static_q_len=1)
+        process(decode_bq_sz, static_q_len=1)
 
     @pl.when(jnp.logical_and(decode_end <= seq_idx, seq_idx < prefill_end))
     def process_prefill():
-        process(static_q_len=chunk_prefill_size)
+        process(prefill_bq_sz, static_q_len=chunk_prefill_size)
 
     @pl.when(jnp.logical_and(prefill_end <= seq_idx, seq_idx < mixed_end))
     def process_mixed():
-        process()
+        process(prefill_bq_sz)
 
     @pl.when(seq_idx == num_seqs - 1)
     def epilogue():
@@ -1097,7 +1113,8 @@ def dynamic_validate_inputs(
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
+    decode_num_queries_per_block: int | None = None,
+    prefill_num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1122,7 +1139,8 @@ def dynamic_validate_inputs(
         v_scale=v_scale,
         chunk_prefill_size=chunk_prefill_size,
         num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
+        decode_num_queries_per_block=decode_num_queries_per_block,
+        prefill_num_queries_per_block=prefill_num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
         debug_mode=debug_mode,
     )
@@ -1189,7 +1207,8 @@ def static_validate_inputs(
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
+    decode_num_queries_per_block: int | None = None,
+    prefill_num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1291,9 +1310,12 @@ def static_validate_inputs(
     if num_kv_pages_per_block is not None:
         if num_kv_pages_per_block <= 0:
             raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
-    if num_queries_per_block is not None:
-        if num_queries_per_block <= 0:
-            raise ValueError(f"{num_queries_per_block=} must be positive.")
+    if decode_num_queries_per_block is not None:
+        if decode_num_queries_per_block <= 0:
+            raise ValueError(f"{decode_num_queries_per_block=} must be positive.")
+    if prefill_num_queries_per_block is not None:
+        if prefill_num_queries_per_block <= 0:
+            raise ValueError(f"{prefill_num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 
@@ -1319,7 +1341,8 @@ def static_validate_inputs(
         "v_scale",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
-        "num_queries_per_block",
+        "decode_num_queries_per_block",
+        "prefill_num_queries_per_block",
         "vmem_limit_bytes",
         "debug_mode",
     ),
@@ -1351,7 +1374,8 @@ def ragged_paged_attention_hd64(
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
     num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
+    decode_num_queries_per_block: int | None = None,
+    prefill_num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1436,9 +1460,10 @@ def ragged_paged_attention_hd64(
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
     bkv_p = num_kv_pages_per_block
-    bq_sz = num_queries_per_block
-    if bq_sz is None or bkv_p is None:
-        bkv_p, bq_sz = get_tuned_block_sizes(
+    decode_bq_sz = decode_num_queries_per_block
+    prefill_bq_sz = prefill_num_queries_per_block
+    if decode_bq_sz is None or prefill_bq_sz is None or bkv_p is None:
+        bkv_p, decode_bq_sz, prefill_bq_sz = get_tuned_block_sizes(
             q.dtype,
             kv_cache.dtype,
             actual_num_q_heads,
@@ -1468,6 +1493,7 @@ def ragged_paged_attention_hd64(
         pl.BlockSpec(memory_space=pltpu.HBM),
     ]
 
+    bq_sz = prefill_bq_sz
     bkv_double_buf = pltpu.VMEM(
         (2, bkv_sz, *kv_cache.shape[2:]),
         kv_cache.dtype,
@@ -1517,7 +1543,7 @@ def ragged_paged_attention_hd64(
         jnp.full((6, ), -1, jnp.int32),
     )
 
-    scope_name = f"RPA-HD_64-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
+    scope_name = f"RPA-HD_64-dbq_{decode_bq_sz}-pbq_{prefill_bq_sz}-bkvp_{bkv_p}-p_{page_size}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -1531,8 +1557,9 @@ def ragged_paged_attention_hd64(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 chunk_prefill_size=chunk_prefill_size,
-                bq_sz=bq_sz,
                 bkv_p=bkv_p,
+                decode_bq_sz=decode_bq_sz,
+                prefill_bq_sz=prefill_bq_sz,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
