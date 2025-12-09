@@ -942,11 +942,15 @@ def _ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+            bo_ref = bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 actual_num_kv_heads,
-                bq_sz * num_q_heads_per_kv_head_per_packing,
+                max_bq_sz * num_q_heads_per_kv_head_per_packing,
                 actual_head_dim_x2,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            )
+            store_len = actual_bq_sz * num_q_heads_per_kv_head_per_packing
+            bo_ref[:, :store_len, :] = pltpu.bitcast(out, jnp.int32)[
+                :, :store_len, :
+            ]
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -1462,9 +1466,9 @@ def ragged_paged_attention_hd64(
             pages_per_seq,
         )
 
-    bq_sz_decode = 16
-    bq_sz_prefill = 16
-    bq_sz_mixed = 16
+    bq_sz_decode = 32
+    bq_sz_prefill = 128
+    bq_sz_mixed = 32
     bkv_p = 24
     if sliding_window is not None:
         bkv_p = 4
