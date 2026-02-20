@@ -260,6 +260,8 @@ def _ragged_paged_attention_kernel(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
+    kv_update_scratch,  #[bq_sz, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    kv_update_sem,
     *,
     sm_scale: float,
     sliding_window: int | None = None,
@@ -486,9 +488,6 @@ def _ragged_paged_attention_kernel(
         debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
 
         if not wait:
-            # Make sure the current bkv buffer is safe to overwrite.
-            wait_update_kv_cache(bkv_sem_idx)
-
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
             for i in range(bkv_p):
@@ -668,25 +667,60 @@ def _ragged_paged_attention_kernel(
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
-    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
-        bkv_update_ids_ref[bkv_sem_idx] = seq_idx
-        bkv_update_ids_ref[bkv_sem_idx + 2] = offset
-        bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
-        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-    def wait_update_kv_cache(bkv_sem_idx):
-        update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
+    def fetch_kv_for_update(seq_idx, bq_idx, wait=False):
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        @pl.when(update_sz > 0)
-        def _():
-            seq_idx = bkv_update_ids_ref[bkv_sem_idx]
-            offset = bkv_update_ids_ref[bkv_sem_idx + 2]
-            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
-            _update_kv_cache(seq_idx,
-                             bkv_sem_idx,
-                             offset,
-                             update_sz,
-                             wait=True)
+        _async_copy(kv_hbm_ref.at[pl.ds(q_len_start, sz)],
+                    kv_update_scratch.at[pl.ds(0, sz)],
+                    kv_update_sem,
+                    wait=wait)
+
+    def write_kv_update(seq_idx, bq_idx):
+
+        def _write_kv_cache_per_page(_, state):
+            remaining_sz, kv_update_scratch_index, kv_idx = state
+
+            page_idx_in_seq = kv_idx // page_size
+            page_offset = kv_idx % page_size
+            write_sz = jnp.minimum(remaining_sz, page_size - page_offset)
+
+            page_table_idx = seq_idx * pages_per_seq + page_idx_in_seq
+            starting_pages = page_indices_ref[page_table_idx]
+            kv_cache_idx = starting_pages * page_size + page_offset
+
+            cache_hbm_shape = updated_kv_cache_hbm_ref.shape
+            cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
+                cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
+
+            @pl.when(write_sz > 0)
+            def _do_write():
+                _async_copy(kv_update_scratch.at[pl.ds(kv_update_scratch_index,
+                                                       write_sz)],
+                            cache_hbm_ref.at[pl.ds(kv_cache_idx, write_sz)],
+                            kv_update_sem,
+                            wait=False)
+                _async_copy(kv_update_scratch.at[pl.ds(kv_update_scratch_index,
+                                                       write_sz)],
+                            cache_hbm_ref.at[pl.ds(kv_cache_idx, write_sz)],
+                            kv_update_sem,
+                            wait=True)
+
+            return (remaining_sz - write_sz,
+                    kv_update_scratch_index + write_sz, kv_idx + write_sz)
+
+        kv_cache_start_idx = kv_len - (cu_q_lens_ref[seq_idx + 1] -
+                                       cu_q_lens_ref[seq_idx]) + bq_idx * bq_sz
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        total_sz = jnp.minimum(bq_sz, q_end - q_len_start)
+
+        # Make sure the write pages are aligned with the page_table
+        pages_to_write = cdiv(kv_cache_start_idx % page_size + total_sz, page_size)
+        lax.fori_loop(0, pages_to_write, _write_kv_cache_per_page,
+                      (total_sz, 0, kv_cache_start_idx))
 
     def load_bq(bq_sem_idx, kv_head_idx, *, actual_bq_sz=bq_sz):
         q_ref = (bq_x2_ref.bitcast(
@@ -836,6 +870,8 @@ def _ragged_paged_attention_kernel(
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
+            fetch_kv_for_update(seq_idx, bq_idx, wait=False)
+
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
                 assert bkv_sz % kv_packing == 0
@@ -861,12 +897,12 @@ def _ragged_paged_attention_kernel(
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
                                                    bkv_sem_idx)
 
-                # Start updating bkv to kv cache if applicable.
-                # Only needed in first bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == 0))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                          update_sz)
+                # # Start updating bkv to kv cache if applicable.
+                # # Only needed in first bq loop.
+                # @pl.when(jnp.logical_and(update_sz > 0, bq_idx == 0))
+                # def update_cur_bkv_to_cache():
+                #     start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                #                           update_sz)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -941,6 +977,9 @@ def _ragged_paged_attention_kernel(
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
+            fetch_kv_for_update(seq_idx, bq_idx, wait=True)
+            write_kv_update(seq_idx, bq_idx)
+
             # Load acc and calculate final output.
             acc = acc_ref[...]
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa
@@ -997,7 +1036,6 @@ def _ragged_paged_attention_kernel(
     def epilogue():
         for i in range(2):
             wait_send_bo(i)
-            wait_update_kv_cache(i)
 
     ### ------- Kernel end ------- ###
 
@@ -1513,6 +1551,11 @@ def ragged_paged_attention(
         jnp.float32,
     )
 
+    kv_update_scratch = pltpu.VMEM(
+        (bq_sz, *kv_cache.shape[2:]),
+        kv_cache.dtype,
+    )
+
     scratch_shapes = [
         bkv_double_buf,  # Double buffering for kv block.
         bq_double_buf,  # Double buffering for q block.
@@ -1523,6 +1566,8 @@ def ragged_paged_attention(
         l_scratch,
         m_scratch,
         acc_scratch,
+        kv_update_scratch,
+        pltpu.SemaphoreType.DMA,
     ]
 
     scalar_prefetches = (
@@ -1581,6 +1626,7 @@ def ragged_paged_attention(
             9: 1
         },
         name=scope_name,
+        #interpret=True,
     )
 
     output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
