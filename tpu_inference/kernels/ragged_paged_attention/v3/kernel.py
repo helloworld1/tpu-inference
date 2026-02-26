@@ -869,6 +869,11 @@ def _ragged_paged_attention_kernel(
             def read_initial_kv_update():
                 read_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=False)
 
+            @pl.when(bq_idx == num_bq - 1)
+            def read_initial_kv_update():
+                read_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=True)
+                write_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=False)
+
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
                 assert bkv_sz % kv_packing == 0
@@ -975,13 +980,17 @@ def _ragged_paged_attention_kernel(
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
 
-            read_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=True)
+            @pl.when(bq_idx != num_bq - 1)
+            def _():
+                read_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=True)
 
             @pl.when(bq_idx > 0)
             def wait_prev_write():
                 write_kv_update(seq_idx, bq_idx - 1, (bq_idx - 1) % 2, wait=True)
 
-            write_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=False)
+            @pl.when(bq_idx != num_bq - 1)
+            def _():
+                write_kv_update(seq_idx, bq_idx, bq_idx % 2, wait=False)
 
             @pl.when(bq_idx < num_bq - 1)
             def read_next_kv_update():
