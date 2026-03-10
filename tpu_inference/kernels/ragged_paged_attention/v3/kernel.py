@@ -235,6 +235,55 @@ def get_kv_cache_shape(
     )
 
 
+@jax.jit(donate_argnames="kv_cache")
+def update_kv_cache_jax(
+    kv: jax.Array,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+):
+  total_num_pages, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = kv_cache.shape
+  max_num_seqs = kv_lens.shape[0]
+  num_page_indices = page_indices.shape[0]
+  pages_per_seq = num_page_indices // max_num_seqs
+  
+  max_num_tokens = kv.shape[0]
+
+  num_seqs = distribution[-1]
+  max_valid_q = cu_q_lens[num_seqs]
+  
+  seq_indices = jnp.arange(max_num_seqs + 1)
+  safe_cu_q_lens = jnp.where(seq_indices <= num_seqs, cu_q_lens, max_num_tokens + 1)
+
+  token_indices = jnp.arange(max_num_tokens)
+  seq_idx = jnp.searchsorted(safe_cu_q_lens, token_indices, side="right", method="sort") - 1
+  seq_idx_safe = jnp.clip(seq_idx, 0, max_num_seqs - 1)
+
+  seq_q_start = safe_cu_q_lens[seq_idx_safe]
+  seq_q_end = safe_cu_q_lens[seq_idx_safe + 1]
+  seq_q_len = seq_q_end - seq_q_start
+  seq_kv_lens = kv_lens[seq_idx_safe]
+
+  offset_in_update = token_indices - seq_q_start
+  pos_in_seq = seq_kv_lens - seq_q_len + offset_in_update
+  
+  page_idx_in_seq = pos_in_seq // page_size
+  offset_in_page = pos_in_seq % page_size
+
+  flat_page_indices_idx = seq_idx_safe * pages_per_seq + page_idx_in_seq
+  flat_page_indices_idx_safe = jnp.clip(flat_page_indices_idx, 0, num_page_indices - 1)
+  physical_page_idx = page_indices[flat_page_indices_idx_safe]
+
+  mask = token_indices < max_valid_q
+
+  physical_page_idx_int = physical_page_idx.astype(jnp.int32)
+  safe_physical_page_idx = jnp.where(mask, physical_page_idx_int, total_num_pages)
+
+  kv_cache = kv_cache.at[safe_physical_page_idx, offset_in_page].set(kv, mode="drop")
+  return kv_cache
+
 def _ragged_paged_attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
@@ -487,7 +536,7 @@ def _ragged_paged_attention_kernel(
 
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
-            wait_update_kv_cache(bkv_sem_idx)
+            #wait_update_kv_cache(bkv_sem_idx)
 
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
@@ -863,10 +912,10 @@ def _ragged_paged_attention_kernel(
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in first bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == 0))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                          update_sz)
+                # @pl.when(jnp.logical_and(update_sz > 0, bq_idx == 0))
+                # def update_cur_bkv_to_cache():
+                #     start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                #                           update_sz)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -997,7 +1046,7 @@ def _ragged_paged_attention_kernel(
     def epilogue():
         for i in range(2):
             wait_send_bo(i)
-            wait_update_kv_cache(i)
+            #wait_update_kv_cache(i)
 
     ### ------- Kernel end ------- ###
 
@@ -1582,7 +1631,10 @@ def ragged_paged_attention(
         name=scope_name,
     )
 
-    output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
+    updated_kv_cache = update_kv_cache_jax(kv, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+
+    #output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
+    output, _ = kernel(*scalar_prefetches, q, kv, kv_cache)
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head,
                         actual_head_dim),
